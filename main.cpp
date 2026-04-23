@@ -3,8 +3,10 @@ using namespace std;
 
 const int PAGE_SIZE = 4096;
 const int MAX_KEY_LEN = 64;
-const int MAX_KEYS = (PAGE_SIZE - 16) / (MAX_KEY_LEN + 8);
-const int MAX_CHILDREN = MAX_KEYS + 1;
+const int HEADER_SIZE = 16;
+const int KEY_SPACE = PAGE_SIZE - HEADER_SIZE;
+const int ENTRY_SIZE = MAX_KEY_LEN + 4;
+const int MAX_KEYS = KEY_SPACE / ENTRY_SIZE;
 
 const char* DB_FILE = "bptree.db";
 
@@ -12,14 +14,38 @@ struct Node {
     bool is_leaf;
     int key_count;
     int next_page;
-    int keys[MAX_KEYS];
-    int children[MAX_CHILDREN];
-    char key_str[MAX_KEYS][MAX_KEY_LEN + 1];
+    char data[PAGE_SIZE - HEADER_SIZE];
 
     Node() : is_leaf(false), key_count(0), next_page(-1) {
-        memset(keys, 0, sizeof(keys));
-        memset(children, -1, sizeof(children));
-        memset(key_str, 0, sizeof(key_str));
+        memset(data, 0, sizeof(data));
+    }
+
+    void set_key(int idx, const char* key) {
+        memcpy(data + idx * ENTRY_SIZE, key, MAX_KEY_LEN);
+    }
+
+    const char* get_key(int idx) const {
+        return data + idx * ENTRY_SIZE;
+    }
+
+    void set_value(int idx, int value) {
+        memcpy(data + idx * ENTRY_SIZE + MAX_KEY_LEN, &value, 4);
+    }
+
+    int get_value(int idx) const {
+        int value;
+        memcpy(&value, data + idx * ENTRY_SIZE + MAX_KEY_LEN, 4);
+        return value;
+    }
+
+    void set_child(int idx, int child) {
+        memcpy(data + idx * 4, &child, 4);
+    }
+
+    int get_child(int idx) const {
+        int child;
+        memcpy(&child, data + idx * 4, 4);
+        return child;
     }
 };
 
@@ -29,13 +55,35 @@ private:
     int root_page;
     int free_page_head;
     unordered_map<int, Node*> cache;
-    static const int CACHE_SIZE = 1000;
+    list<int> lru_list;
+    static const int CACHE_SIZE = 500;
+
+    void lru_update(int page) {
+        auto it = std::find(lru_list.begin(), lru_list.end(), page);
+        if (it != lru_list.end()) {
+            lru_list.erase(it);
+        }
+        lru_list.push_front(page);
+    }
+
+    void lru_evict() {
+        if (lru_list.size() > CACHE_SIZE) {
+            int page = lru_list.back();
+            lru_list.pop_back();
+            if (page != root_page && cache.count(page)) {
+                write_page(page, cache[page]);
+                delete cache[page];
+                cache.erase(page);
+            }
+        }
+    }
 
     int alloc_page() {
         if (free_page_head != -1) {
             int page = free_page_head;
             Node* n = load_page(page);
             free_page_head = n->next_page;
+            write_page(page, n);
             delete n;
             return page;
         }
@@ -50,23 +98,18 @@ private:
         n->next_page = free_page_head;
         free_page_head = page;
         write_page(page, n);
-        delete n;
     }
 
     Node* load_page(int page) {
-        if (cache.count(page)) return cache[page];
+        if (cache.count(page)) {
+            lru_update(page);
+            return cache[page];
+        }
         Node* n = new Node();
         db.seekg(page * PAGE_SIZE);
         db.read((char*)n, PAGE_SIZE);
-        if (cache.size() >= CACHE_SIZE) {
-            for (auto it = cache.begin(); it != cache.end(); ) {
-                if (it->first != root_page) {
-                    write_page(it->first, it->second);
-                    delete it->second;
-                    it = cache.erase(it);
-                } else ++it;
-            }
-        }
+        lru_evict();
+        lru_update(page);
         cache[page] = n;
         return n;
     }
@@ -77,26 +120,19 @@ private:
         db.flush();
     }
 
-    void uncache(int page) {
-        if (cache.count(page)) {
-            delete cache[page];
-            cache.erase(page);
-        }
-    }
-
     int compare_key(const char* a, const char* b) {
         return strcmp(a, b);
     }
 
     void insert_to_leaf(Node* leaf, const char* key, int value) {
         int i = leaf->key_count - 1;
-        while (i >= 0 && compare_key(key, leaf->key_str[i]) < 0) {
-            strcpy(leaf->key_str[i + 1], leaf->key_str[i]);
-            leaf->keys[i + 1] = leaf->keys[i];
+        while (i >= 0 && compare_key(key, leaf->get_key(i)) < 0) {
+            leaf->set_key(i + 1, leaf->get_key(i));
+            leaf->set_value(i + 1, leaf->get_value(i));
             i--;
         }
-        strcpy(leaf->key_str[i + 1], key);
-        leaf->keys[i + 1] = value;
+        leaf->set_key(i + 1, key);
+        leaf->set_value(i + 1, value);
         leaf->key_count++;
     }
 
@@ -108,8 +144,8 @@ private:
         leaf->key_count = mid;
 
         for (int i = 0; i < new_leaf->key_count; i++) {
-            strcpy(new_leaf->key_str[i], leaf->key_str[mid + i]);
-            new_leaf->keys[i] = leaf->keys[mid + i];
+            new_leaf->set_key(i, leaf->get_key(mid + i));
+            new_leaf->set_value(i, leaf->get_value(mid + i));
         }
 
         new_leaf->next_page = leaf->next_page;
@@ -117,38 +153,35 @@ private:
         new_page = leaf->next_page;
         write_page(new_page, new_leaf);
         delete new_leaf;
-        strcpy(split_key, leaf->key_str[0]);
+        strcpy(split_key, leaf->get_key(0));
     }
 
-    void insert_to_internal(Node* node, const char* key, int value, int right_child) {
+    void insert_to_internal(Node* node, const char* key, int right_child) {
         int i = node->key_count - 1;
-        while (i >= 0 && compare_key(key, node->key_str[i]) < 0) {
-            strcpy(node->key_str[i + 1], node->key_str[i]);
-            node->children[i + 2] = node->children[i + 1];
+        while (i >= 0 && compare_key(key, node->get_key(i)) < 0) {
+            node->set_key(i + 1, node->get_key(i));
+            node->set_child(i + 2, node->get_child(i + 1));
             i--;
         }
-        strcpy(node->key_str[i + 1], key);
-        node->keys[i + 1] = value;
-        node->children[i + 2] = right_child;
+        node->set_key(i + 1, key);
+        node->set_child(i + 2, right_child);
         node->key_count++;
     }
 
-    void split_internal(int page, Node* node, char* split_key, int& new_page, int mid_val) {
+    void split_internal(int page, Node* node, char* split_key, int& new_page) {
         Node* new_node = new Node();
         new_node->is_leaf = false;
         int mid = node->key_count / 2;
         new_node->key_count = node->key_count - mid - 1;
         node->key_count = mid;
 
-        strcpy(split_key, node->key_str[mid]);
-        int split_val = node->keys[mid];
+        strcpy(split_key, node->get_key(mid));
 
         for (int i = 0; i < new_node->key_count; i++) {
-            strcpy(new_node->key_str[i], node->key_str[mid + 1 + i]);
-            new_node->keys[i] = node->keys[mid + 1 + i];
+            new_node->set_key(i, node->get_key(mid + 1 + i));
         }
         for (int i = 0; i <= new_node->key_count; i++) {
-            new_node->children[i] = node->children[mid + 1 + i];
+            new_node->set_child(i, node->get_child(mid + 1 + i));
         }
 
         new_page = alloc_page();
@@ -156,7 +189,7 @@ private:
         delete new_node;
     }
 
-    bool insert(int page, const char* key, int value, int& new_page, char* split_key, int& split_val, bool& split) {
+    bool insert(int page, const char* key, int value, int& new_page, char* split_key, bool& split) {
         Node* node = load_page(page);
         split = false;
 
@@ -176,37 +209,35 @@ private:
                 write_page(new_page, new_leaf);
             }
             split = true;
-            split_val = 0;
             return true;
         }
 
         int child = 0;
-        while (child < node->key_count && compare_key(key, node->key_str[child]) >= 0) {
+        while (child < node->key_count && compare_key(key, node->get_key(child)) >= 0) {
             child++;
         }
 
-        int child_page = node->children[child];
+        int child_page = node->get_child(child);
         int new_child_page;
         char child_split_key[MAX_KEY_LEN + 1];
-        int child_split_val;
         bool child_split;
 
-        if (!insert(child_page, key, value, new_child_page, child_split_key, child_split_val, child_split)) {
+        if (!insert(child_page, key, value, new_child_page, child_split_key, child_split)) {
             return false;
         }
 
         if (child_split) {
             if (node->key_count < MAX_KEYS) {
-                insert_to_internal(node, child_split_key, child_split_val, new_child_page);
+                insert_to_internal(node, child_split_key, new_child_page);
                 write_page(page, node);
             } else {
-                split_internal(page, node, split_key, new_page, split_val);
+                split_internal(page, node, split_key, new_page);
                 if (compare_key(child_split_key, split_key) < 0) {
-                    insert_to_internal(node, child_split_key, child_split_val, new_child_page);
+                    insert_to_internal(node, child_split_key, new_child_page);
                     write_page(page, node);
                 } else {
                     Node* new_node = load_page(new_page);
-                    insert_to_internal(new_node, child_split_key, child_split_val, new_child_page);
+                    insert_to_internal(new_node, child_split_key, new_child_page);
                     write_page(new_page, new_node);
                 }
                 split = true;
@@ -220,7 +251,7 @@ private:
     bool remove_from_leaf(Node* leaf, const char* key, int value) {
         int idx = -1;
         for (int i = 0; i < leaf->key_count; i++) {
-            if (strcmp(leaf->key_str[i], key) == 0 && leaf->keys[i] == value) {
+            if (strcmp(leaf->get_key(i), key) == 0 && leaf->get_value(i) == value) {
                 idx = i;
                 break;
             }
@@ -228,8 +259,8 @@ private:
         if (idx == -1) return false;
 
         for (int i = idx; i < leaf->key_count - 1; i++) {
-            strcpy(leaf->key_str[i], leaf->key_str[i + 1]);
-            leaf->keys[i] = leaf->keys[i + 1];
+            leaf->set_key(i, leaf->get_key(i + 1));
+            leaf->set_value(i, leaf->get_value(i + 1));
         }
         leaf->key_count--;
         return true;
@@ -245,11 +276,11 @@ private:
         }
 
         int child = 0;
-        while (child < node->key_count && compare_key(key, node->key_str[child]) >= 0) {
+        while (child < node->key_count && compare_key(key, node->get_key(child)) >= 0) {
             child++;
         }
 
-        return remove(node->children[child], key, value);
+        return remove(node->get_child(child), key, value);
     }
 
     void find_values(int page, const char* key, vector<int>& result) {
@@ -257,18 +288,18 @@ private:
 
         if (node->is_leaf) {
             for (int i = 0; i < node->key_count; i++) {
-                if (strcmp(node->key_str[i], key) == 0) {
-                    result.push_back(node->keys[i]);
+                if (strcmp(node->get_key(i), key) == 0) {
+                    result.push_back(node->get_value(i));
                 }
             }
             return;
         }
 
         int child = 0;
-        while (child < node->key_count && compare_key(key, node->key_str[child]) >= 0) {
+        while (child < node->key_count && compare_key(key, node->get_key(child)) >= 0) {
             child++;
         }
-        find_values(node->children[child], key, result);
+        find_values(node->get_child(child), key, result);
     }
 
 public:
@@ -276,7 +307,8 @@ public:
         bool exists = ifstream(DB_FILE).good();
         db.open(DB_FILE, ios::in | ios::out | ios::binary);
 
-        if (!exists) {
+        if (!exists || db.peek() == ifstream::traits_type::eof()) {
+            db.close();
             db.open(DB_FILE, ios::in | ios::out | ios::binary | ios::trunc);
             root_page = alloc_page();
             Node* root = new Node();
@@ -305,19 +337,17 @@ public:
     void insert(const char* key, int value) {
         int new_page;
         char split_key[MAX_KEY_LEN + 1];
-        int split_val;
         bool split;
 
-        if (insert(root_page, key, value, new_page, split_key, split_val, split)) {
+        if (insert(root_page, key, value, new_page, split_key, split)) {
             if (split) {
                 int new_root = alloc_page();
                 Node* root = new Node();
                 root->is_leaf = false;
                 root->key_count = 1;
-                strcpy(root->key_str[0], split_key);
-                root->keys[0] = split_val;
-                root->children[0] = root_page;
-                root->children[1] = new_page;
+                root->set_key(0, split_key);
+                root->set_child(0, root_page);
+                root->set_child(1, new_page);
                 write_page(new_root, root);
                 delete root;
                 root_page = new_root;
