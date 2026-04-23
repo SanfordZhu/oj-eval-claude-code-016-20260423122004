@@ -54,27 +54,20 @@ private:
     fstream db;
     int root_page;
     int free_page_head;
-    unordered_map<int, Node*> cache;
-    list<int> lru_list;
-    static const int CACHE_SIZE = 500;
+    map<int, Node*> cache;
+    static const int CACHE_SIZE = 20;
 
-    void lru_update(int page) {
-        auto it = std::find(lru_list.begin(), lru_list.end(), page);
-        if (it != lru_list.end()) {
-            lru_list.erase(it);
-        }
-        lru_list.push_front(page);
-    }
-
-    void lru_evict() {
-        if (lru_list.size() > CACHE_SIZE) {
-            int page = lru_list.back();
-            lru_list.pop_back();
-            if (page != root_page && cache.count(page)) {
-                write_page(page, cache[page]);
-                delete cache[page];
-                cache.erase(page);
+    void evict_if_needed() {
+        while ((int)cache.size() > CACHE_SIZE) {
+            int page = cache.begin()->first;
+            if (page == root_page) {
+                cache.erase(cache.begin());
+                continue;
             }
+            Node* n = cache.begin()->second;
+            write_page(page, n);
+            delete n;
+            cache.erase(cache.begin());
         }
     }
 
@@ -84,7 +77,12 @@ private:
             Node* n = load_page(page);
             free_page_head = n->next_page;
             write_page(page, n);
-            delete n;
+            if (cache.count(page)) {
+                delete cache[page];
+                cache.erase(page);
+            } else {
+                delete n;
+            }
             return page;
         }
         db.seekp(0, ios::end);
@@ -101,15 +99,11 @@ private:
     }
 
     Node* load_page(int page) {
-        if (cache.count(page)) {
-            lru_update(page);
-            return cache[page];
-        }
+        if (cache.count(page)) return cache[page];
+        evict_if_needed();
         Node* n = new Node();
         db.seekg(page * PAGE_SIZE);
         db.read((char*)n, PAGE_SIZE);
-        lru_evict();
-        lru_update(page);
         cache[page] = n;
         return n;
     }
@@ -327,6 +321,7 @@ public:
             write_page(p.first, p.second);
             delete p.second;
         }
+        cache.clear();
         db.seekp(0);
         db.write((char*)&root_page, sizeof(int));
         db.write((char*)&free_page_head, sizeof(int));
