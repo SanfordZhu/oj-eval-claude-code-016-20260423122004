@@ -1,4 +1,6 @@
 #include <bits/stdc++.h>
+#include <fcntl.h>
+#include <unistd.h>
 using namespace std;
 
 const int PAGE_SIZE = 4096;
@@ -51,7 +53,7 @@ struct Node {
 
 class BPTree {
 private:
-    fstream db;
+    int fd;
     int root_page;
     int free_page_head;
     int cached_page;
@@ -59,9 +61,7 @@ private:
 
     void flush_cache() {
         if (cached_page >= 0 && cached_node) {
-            db.seekp(cached_page * PAGE_SIZE);
-            db.write((char*)cached_node, PAGE_SIZE);
-            db.flush();
+            pwrite(fd, cached_node, PAGE_SIZE, cached_page * PAGE_SIZE);
         }
     }
 
@@ -70,20 +70,15 @@ private:
         flush_cache();
         cached_page = page;
         if (!cached_node) cached_node = new Node();
-        db.seekg(page * PAGE_SIZE);
-        db.read((char*)cached_node, PAGE_SIZE);
+        pread(fd, cached_node, PAGE_SIZE, page * PAGE_SIZE);
     }
 
     void write_page(int page, Node* n) {
         if (cached_page == page) {
             memcpy(cached_node, n, PAGE_SIZE);
-            db.seekp(page * PAGE_SIZE);
-            db.write((char*)n, PAGE_SIZE);
-            db.flush();
+            pwrite(fd, cached_node, PAGE_SIZE, page * PAGE_SIZE);
         } else {
-            db.seekp(page * PAGE_SIZE);
-            db.write((char*)n, PAGE_SIZE);
-            db.flush();
+            pwrite(fd, n, PAGE_SIZE, page * PAGE_SIZE);
         }
     }
 
@@ -275,21 +270,20 @@ private:
     }
 
 public:
-    BPTree() : root_page(-1), free_page_head(-1), cached_page(-1), cached_node(nullptr) {
-        bool exists = ifstream(DB_FILE).good();
-        db.open(DB_FILE, ios::in | ios::out | ios::binary);
+    BPTree() : root_page(-1), free_page_head(-1), cached_page(-1), cached_node(nullptr), fd(-1) {
+        bool exists = access(DB_FILE, F_OK) == 0;
+        fd = open(DB_FILE, O_RDWR | O_CREAT, 0644);
 
-        if (!exists || db.peek() == ifstream::traits_type::eof()) {
-            db.close();
-            db.open(DB_FILE, ios::in | ios::out | ios::binary | ios::trunc);
+        if (!exists || lseek(fd, 0, SEEK_END) == 0) {
             root_page = alloc_page();
             Node root;
             root.is_leaf = true;
             write_page(root_page, &root);
         } else {
-            db.seekg(0);
-            db.read((char*)&root_page, sizeof(int));
-            db.read((char*)&free_page_head, sizeof(int));
+            char header[8];
+            pread(fd, header, 8, 0);
+            memcpy(&root_page, header, 4);
+            memcpy(&free_page_head, header + 4, 4);
         }
     }
 
@@ -299,11 +293,14 @@ public:
             delete cached_node;
             cached_node = nullptr;
         }
-        db.seekp(0);
-        db.write((char*)&root_page, sizeof(int));
-        db.write((char*)&free_page_head, sizeof(int));
-        db.flush();
-        db.close();
+        if (fd >= 0) {
+            char header[8];
+            memcpy(header, &root_page, 4);
+            memcpy(header + 4, &free_page_head, 4);
+            pwrite(fd, header, 8, 0);
+            fsync(fd);
+            close(fd);
+        }
     }
 
     int alloc_page() {
@@ -314,8 +311,8 @@ public:
             write_page(page, cached_node);
             return page;
         }
-        db.seekp(0, ios::end);
-        int page = db.tellp() / PAGE_SIZE;
+        off_t size = lseek(fd, 0, SEEK_END);
+        int page = size / PAGE_SIZE;
         return page;
     }
 
