@@ -54,64 +54,37 @@ private:
     fstream db;
     int root_page;
     int free_page_head;
-    map<int, Node*> cache;
-    static const int CACHE_SIZE = 20;
+    int cached_page;
+    Node* cached_node;
 
-    void evict_if_needed() {
-        while ((int)cache.size() > CACHE_SIZE) {
-            int page = cache.begin()->first;
-            if (page == root_page) {
-                cache.erase(cache.begin());
-                continue;
-            }
-            Node* n = cache.begin()->second;
-            write_page(page, n);
-            delete n;
-            cache.erase(cache.begin());
+    void flush_cache() {
+        if (cached_page >= 0 && cached_node) {
+            db.seekp(cached_page * PAGE_SIZE);
+            db.write((char*)cached_node, PAGE_SIZE);
+            db.flush();
         }
     }
 
-    int alloc_page() {
-        if (free_page_head != -1) {
-            int page = free_page_head;
-            Node* n = load_page(page);
-            free_page_head = n->next_page;
-            write_page(page, n);
-            if (cache.count(page)) {
-                delete cache[page];
-                cache.erase(page);
-            } else {
-                delete n;
-            }
-            return page;
-        }
-        db.seekp(0, ios::end);
-        int page = db.tellp() / PAGE_SIZE;
-        return page;
-    }
-
-    void free_page(int page) {
-        if (page < 0) return;
-        Node* n = load_page(page);
-        n->next_page = free_page_head;
-        free_page_head = page;
-        write_page(page, n);
-    }
-
-    Node* load_page(int page) {
-        if (cache.count(page)) return cache[page];
-        evict_if_needed();
-        Node* n = new Node();
+    void load_page(int page) {
+        if (cached_page == page) return;
+        flush_cache();
+        cached_page = page;
+        if (!cached_node) cached_node = new Node();
         db.seekg(page * PAGE_SIZE);
-        db.read((char*)n, PAGE_SIZE);
-        cache[page] = n;
-        return n;
+        db.read((char*)cached_node, PAGE_SIZE);
     }
 
     void write_page(int page, Node* n) {
-        db.seekp(page * PAGE_SIZE);
-        db.write((char*)n, PAGE_SIZE);
-        db.flush();
+        if (cached_page == page) {
+            memcpy(cached_node, n, PAGE_SIZE);
+            db.seekp(page * PAGE_SIZE);
+            db.write((char*)n, PAGE_SIZE);
+            db.flush();
+        } else {
+            db.seekp(page * PAGE_SIZE);
+            db.write((char*)n, PAGE_SIZE);
+            db.flush();
+        }
     }
 
     int compare_key(const char* a, const char* b) {
@@ -131,22 +104,21 @@ private:
     }
 
     void split_leaf(int page, Node* leaf, char* split_key, int& new_page) {
-        Node* new_leaf = new Node();
-        new_leaf->is_leaf = true;
+        Node new_leaf;
+        new_leaf.is_leaf = true;
         int mid = leaf->key_count / 2;
-        new_leaf->key_count = leaf->key_count - mid;
+        new_leaf.key_count = leaf->key_count - mid;
         leaf->key_count = mid;
 
-        for (int i = 0; i < new_leaf->key_count; i++) {
-            new_leaf->set_key(i, leaf->get_key(mid + i));
-            new_leaf->set_value(i, leaf->get_value(mid + i));
+        for (int i = 0; i < new_leaf.key_count; i++) {
+            new_leaf.set_key(i, leaf->get_key(mid + i));
+            new_leaf.set_value(i, leaf->get_value(mid + i));
         }
 
-        new_leaf->next_page = leaf->next_page;
+        new_leaf.next_page = leaf->next_page;
         leaf->next_page = alloc_page();
         new_page = leaf->next_page;
-        write_page(new_page, new_leaf);
-        delete new_leaf;
+        write_page(new_page, &new_leaf);
         strcpy(split_key, leaf->get_key(0));
     }
 
@@ -163,28 +135,28 @@ private:
     }
 
     void split_internal(int page, Node* node, char* split_key, int& new_page) {
-        Node* new_node = new Node();
-        new_node->is_leaf = false;
+        Node new_node;
+        new_node.is_leaf = false;
         int mid = node->key_count / 2;
-        new_node->key_count = node->key_count - mid - 1;
+        new_node.key_count = node->key_count - mid - 1;
         node->key_count = mid;
 
         strcpy(split_key, node->get_key(mid));
 
-        for (int i = 0; i < new_node->key_count; i++) {
-            new_node->set_key(i, node->get_key(mid + 1 + i));
+        for (int i = 0; i < new_node.key_count; i++) {
+            new_node.set_key(i, node->get_key(mid + 1 + i));
         }
-        for (int i = 0; i <= new_node->key_count; i++) {
-            new_node->set_child(i, node->get_child(mid + 1 + i));
+        for (int i = 0; i <= new_node.key_count; i++) {
+            new_node.set_child(i, node->get_child(mid + 1 + i));
         }
 
         new_page = alloc_page();
-        write_page(new_page, new_node);
-        delete new_node;
+        write_page(new_page, &new_node);
     }
 
     bool insert(int page, const char* key, int value, int& new_page, char* split_key, bool& split) {
-        Node* node = load_page(page);
+        load_page(page);
+        Node* node = cached_node;
         split = false;
 
         if (node->is_leaf) {
@@ -198,9 +170,9 @@ private:
                 insert_to_leaf(node, key, value);
                 write_page(page, node);
             } else {
-                Node* new_leaf = load_page(new_page);
-                insert_to_leaf(new_leaf, key, value);
-                write_page(new_page, new_leaf);
+                load_page(new_page);
+                insert_to_leaf(cached_node, key, value);
+                write_page(new_page, cached_node);
             }
             split = true;
             return true;
@@ -220,6 +192,7 @@ private:
             return false;
         }
 
+        load_page(page);
         if (child_split) {
             if (node->key_count < MAX_KEYS) {
                 insert_to_internal(node, child_split_key, new_child_page);
@@ -230,9 +203,9 @@ private:
                     insert_to_internal(node, child_split_key, new_child_page);
                     write_page(page, node);
                 } else {
-                    Node* new_node = load_page(new_page);
-                    insert_to_internal(new_node, child_split_key, new_child_page);
-                    write_page(new_page, new_node);
+                    load_page(new_page);
+                    insert_to_internal(cached_node, child_split_key, new_child_page);
+                    write_page(new_page, cached_node);
                 }
                 split = true;
             }
@@ -261,7 +234,8 @@ private:
     }
 
     bool remove(int page, const char* key, int value) {
-        Node* node = load_page(page);
+        load_page(page);
+        Node* node = cached_node;
 
         if (node->is_leaf) {
             bool removed = remove_from_leaf(node, key, value);
@@ -278,7 +252,8 @@ private:
     }
 
     void find_values(int page, const char* key, vector<int>& result) {
-        Node* node = load_page(page);
+        load_page(page);
+        Node* node = cached_node;
 
         if (node->is_leaf) {
             for (int i = 0; i < node->key_count; i++) {
@@ -297,7 +272,7 @@ private:
     }
 
 public:
-    BPTree() : root_page(-1), free_page_head(-1) {
+    BPTree() : root_page(-1), free_page_head(-1), cached_page(-1), cached_node(nullptr) {
         bool exists = ifstream(DB_FILE).good();
         db.open(DB_FILE, ios::in | ios::out | ios::binary);
 
@@ -305,10 +280,9 @@ public:
             db.close();
             db.open(DB_FILE, ios::in | ios::out | ios::binary | ios::trunc);
             root_page = alloc_page();
-            Node* root = new Node();
-            root->is_leaf = true;
-            write_page(root_page, root);
-            delete root;
+            Node root;
+            root.is_leaf = true;
+            write_page(root_page, &root);
         } else {
             db.seekg(0);
             db.read((char*)&root_page, sizeof(int));
@@ -317,16 +291,29 @@ public:
     }
 
     ~BPTree() {
-        for (auto& p : cache) {
-            write_page(p.first, p.second);
-            delete p.second;
+        flush_cache();
+        if (cached_node) {
+            delete cached_node;
+            cached_node = nullptr;
         }
-        cache.clear();
         db.seekp(0);
         db.write((char*)&root_page, sizeof(int));
         db.write((char*)&free_page_head, sizeof(int));
         db.flush();
         db.close();
+    }
+
+    int alloc_page() {
+        if (free_page_head != -1) {
+            int page = free_page_head;
+            load_page(page);
+            free_page_head = cached_node->next_page;
+            write_page(page, cached_node);
+            return page;
+        }
+        db.seekp(0, ios::end);
+        int page = db.tellp() / PAGE_SIZE;
+        return page;
     }
 
     void insert(const char* key, int value) {
@@ -337,14 +324,13 @@ public:
         if (insert(root_page, key, value, new_page, split_key, split)) {
             if (split) {
                 int new_root = alloc_page();
-                Node* root = new Node();
-                root->is_leaf = false;
-                root->key_count = 1;
-                root->set_key(0, split_key);
-                root->set_child(0, root_page);
-                root->set_child(1, new_page);
-                write_page(new_root, root);
-                delete root;
+                Node root;
+                root.is_leaf = false;
+                root.key_count = 1;
+                root.set_key(0, split_key);
+                root.set_child(0, root_page);
+                root.set_child(1, new_page);
+                write_page(new_root, &root);
                 root_page = new_root;
             }
         }
