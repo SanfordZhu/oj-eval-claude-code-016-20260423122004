@@ -251,24 +251,27 @@ private:
         return remove(node->get_child(child), key, value);
     }
 
-    void find_values(int page, const char* key, vector<int>& result) {
-        load_page(page);
-        Node* node = cached_node;
+    void find_values(const char* key, vector<int>& result) {
+        int page = root_page;
+        while (true) {
+            load_page(page);
+            Node* node = cached_node;
 
-        if (node->is_leaf) {
-            for (int i = 0; i < node->key_count; i++) {
-                if (strcmp(node->get_key(i), key) == 0) {
-                    result.push_back(node->get_value(i));
+            if (node->is_leaf) {
+                for (int i = 0; i < node->key_count; i++) {
+                    if (strcmp(node->get_key(i), key) == 0) {
+                        result.push_back(node->get_value(i));
+                    }
                 }
+                return;
             }
-            return;
-        }
 
-        int child = 0;
-        while (child < node->key_count && compare_key(key, node->get_key(child)) >= 0) {
-            child++;
+            int child = 0;
+            while (child < node->key_count && compare_key(key, node->get_key(child)) >= 0) {
+                child++;
+            }
+            page = node->get_child(child);
         }
-        find_values(node->get_child(child), key, result);
     }
 
 public:
@@ -342,7 +345,7 @@ public:
 
     vector<int> find(const char* key) {
         vector<int> result;
-        find_values(root_page, key, result);
+        find_values(key, result);
         return result;
     }
 };
